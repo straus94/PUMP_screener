@@ -20,18 +20,18 @@ logging.basicConfig(
 BINANCE_API_KEY = os.getenv('BINANCE_API_KEY')
 BINANCE_API_SECRET = os.getenv('BINANCE_API_SECRET')
 
-BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
-BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
+# BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
+# BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 
 # Инициализация клиентов
 binance_client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
-bybit_client = HTTP(
-    endpoint="https://api.bybit.com",
-    api_key=BYBIT_API_KEY,
-    api_secret=BYBIT_API_SECRET
-)
+# bybit_client = HTTP(
+#     endpoint="https://api.bybit.com",
+#     api_key=BYBIT_API_KEY,
+#     api_secret=BYBIT_API_SECRET
+# )
 
 # Хранение настроек пользователей
 user_settings = {}
@@ -67,15 +67,15 @@ def get_binance_prices():
     return {item['symbol']: float(item['markPrice']) for item in prices}
 
 # Функция для получения цен с ByBit
-def get_bybit_prices():
-    response = bybit_client.latest_information_for_symbol()
-    prices = {}
-    if 'result' in response:
-        for item in response['result']:
-            symbol = item['symbol']
-            last_price = float(item['last_price'])
-            prices[symbol] = last_price
-    return prices
+# def get_bybit_prices():
+#     response = bybit_client.latest_information_for_symbol()
+#     prices = {}
+#     if 'result' in response:
+#         for item in response['result']:
+#             symbol = item['symbol']
+#             last_price = float(item['last_price'])
+#             prices[symbol] = last_price
+#     return prices
 
 # Хранение истории цен
 price_history = {}
@@ -86,8 +86,9 @@ async def monitor_pumps(app):
         current_time = datetime.utcnow()
         # Получаем цены
         binance_prices = get_binance_prices()
-        bybit_prices = get_bybit_prices()
-        all_prices = {**binance_prices, **bybit_prices}
+        # bybit_prices = get_bybit_prices()
+        # all_prices = {**binance_prices, **bybit_prices}
+        all_prices = {**binance_prices}
 
         # Обновляем историю цен
         for symbol, price in all_prices.items():
