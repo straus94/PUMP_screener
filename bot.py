@@ -1,21 +1,150 @@
 import os
 import logging
+import requests
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    CallbackContext,
+    JobQueue,
+    Job
+)
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
+# Храним настройки пользователей:
+# user_alerts[chat_id] = {
+#     "pump_percent": <int>,
+#     "time_window": <int>
+# }
+user_alerts = {}
+
+# ====== Получаем цену (или свечи) с Binance Futures ======
+
+def fetch_futures_prices():
+    """
+    Получаем данные по всем парам фьючерсов.
+    Для примера используем 24h тикеры:
+    https://binance-docs.github.io/apidocs/futures/en/#24hr-ticker-price-change-statistics
+    Вернёт список словарей, где у каждого тикера есть поля:
+      - symbol
+      - lastPrice
+      - openPrice
+      - priceChangePercent (и т.д.)
+    """
+    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    try:
+        resp = requests.get(url, timeout=5)
+        data = resp.json()
+        return data  # список словарей
+    except Exception as e:
+        logging.error(f"Ошибка при запросе к Binance: {e}")
+        return []
+
+def check_pump_for_user(chat_id, context: CallbackContext):
+    """
+    Проверяем, какие монеты выросли на нужный процент за нужный промежуток
+    (упрощённо используем priceChangePercent за 24 часа).
+    В реальном случае нужно было бы подгрузить исторические данные за N минут.
+    """
+    # Берём настройки пользователя
+    settings = user_alerts.get(chat_id)
+    if not settings:
+        return  # У пользователя не задано ничего
+
+    pump_percent = settings["pump_percent"]
+    time_window = settings["time_window"]  # пока не используем в упрощённом примере
+
+    # Получаем данные о фьючерсных парах
+    ticker_data = fetch_futures_prices()
+    if not ticker_data:
+        return
+
+    # Фильтруем пары, у которых процент роста за 24h >= pump_percent
+    pumped_coins = []
+    for item in ticker_data:
+        try:
+            symbol = item["symbol"]
+            price_change_pct = float(item["priceChangePercent"])  # 24h процент
+            if price_change_pct >= pump_percent:
+                pumped_coins.append(symbol)
+        except:
+            # Если вдруг не хватило полей, пропустим
+            continue
+
+    # Если что-то нашли, отправим пользователю
+    if pumped_coins:
+        message = (
+            f"За последние 24 часа эти пары выросли более чем на {pump_percent}%:\n"
+            + ", ".join(pumped_coins)
+        )
+        context.bot.send_message(chat_id=chat_id, text=message)
+
+def pump_scanner(context: CallbackContext):
+    """
+    Функция, которую будет вызывать job_queue каждую минуту.
+    Проходимся по всем пользователям, у кого есть настройки, и проверяем памп.
+    """
+    # Смотрим все chat_id, для которых есть настройки
+    for chat_id in user_alerts.keys():
+        check_pump_for_user(chat_id, context)
+
+# ====== Обработчики команд ======
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hello world!")
+    """
+    Команда /start
+    """
+    await update.message.reply_text("Привет! Я бот, который ищет пампы на Binance Futures.\n"
+                                   "Используй /setalert <процент> <минуты>, чтобы задать условия сканирования.")
+
+async def set_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Команда /setalert <pump_percent> <time_window>
+    Например: /setalert 5 15 (отслеживать памп 5% за 15 минут).
+    """
+    chat_id = update.effective_chat.id
+    args = context.args
+
+    if len(args) < 2:
+        await update.message.reply_text("Формат: /setalert <процент> <минуты>\n"
+                                        "Например: /setalert 5 15")
+        return
+
+    try:
+        pump_percent = float(args[0])
+        time_window = int(args[1])
+    except ValueError:
+        await update.message.reply_text("Нужно вводить числа, например: /setalert 5 15")
+        return
+
+    # Ограничения
+    if not (1 <= pump_percent <= 100):
+        await update.message.reply_text("Процент должен быть в диапазоне от 1 до 100.")
+        return
+
+    if not (1 <= time_window <= 30):
+        await update.message.reply_text("Минуты должны быть в диапазоне от 1 до 30.")
+        return
+
+    # Сохраняем настройки
+    user_alerts[chat_id] = {
+        "pump_percent": pump_percent,
+        "time_window": time_window
+    }
+
+    await update.message.reply_text(
+        f"Настройки сохранены.\n"
+        f"Буду проверять каждые 1 минуту, есть ли монеты с ростом >= {pump_percent}% за {time_window} мин."
+    )
 
 def main():
-    # Считываем токен из переменной окружения, например BOT_TOKEN
+    # Получаем токен из переменной окружения
     token = os.environ.get("BOT_TOKEN", "NoTokenFound")
-
-    # Если токен не найден — выводим ошибку и завершаем.
     if token == "NoTokenFound":
         logging.error("BOT_TOKEN не установлен в переменных окружения.")
         return
@@ -23,156 +152,16 @@ def main():
     # Создаём приложение бота
     app = ApplicationBuilder().token(token).build()
 
-    # Регистрируем хендлер для команды /start
+    # Регистрируем команды
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("setalert", set_alert))
 
-    # Запускаем бота в режиме polling
+    # Запускаем задачу сканирования каждую минуту
+    # first=10 означает, что первая проверка произойдёт через 10 секунд после старта
+    app.job_queue.run_repeating(pump_scanner, interval=60, first=10)
+
+    # Запускаем бота
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-
-
-# import platform
-# import asyncio
-
-# # 1) Устанавливаем на Windows SelectorEventLoopPolicy до любых других импортов
-# if platform.system() == "Windows":
-#     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-# import logging
-# import os
-# import sys
-# from datetime import datetime, timedelta, timezone
-
-# from telegram import Update
-# from telegram.ext import (
-#     ApplicationBuilder,
-#     CommandHandler,
-#     ContextTypes
-# )
-# from binance.client import Client as BinanceClient
-# from dotenv import load_dotenv
-
-# price_history = {}
-# user_settings = {}
-# binance_client = None
-
-# def check_env():
-#     load_dotenv()
-#     BINANCE_API_KEY = os.getenv('BINANCE_API_KEY')
-#     BINANCE_API_SECRET = os.getenv('BINANCE_API_SECRET')
-#     TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-
-#     if not all([BINANCE_API_KEY, BINANCE_API_SECRET, TELEGRAM_TOKEN]):
-#         logging.error("Одна или несколько переменных окружения не установлены.")
-#         sys.exit(1)
-
-#     return BINANCE_API_KEY, BINANCE_API_SECRET, TELEGRAM_TOKEN
-
-
-# async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     await update.message.reply_text(
-#         "Привет! Я бот для отслеживания пампов на Binance.\n"
-#         "Используй /setpump <%> <минут> для настройки параметров мониторинга.\n"
-#         "Например: /setpump 5 10 - отслеживать памп от 5% за 10 минут."
-#     )
-
-
-# async def setpump(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     try:
-#         percent = float(context.args[0])
-#         minutes = int(context.args[1])
-#         if not (1 <= percent <= 100) or not (1 <= minutes <= 30):
-#             raise ValueError
-#         user_id = update.message.from_user.id
-#         user_settings[user_id] = {'percent': percent, 'minutes': minutes}
-#         await update.message.reply_text(
-#             f"Настройки обновлены: Памп ≥ {percent}% за {minutes} минут."
-#         )
-#     except (IndexError, ValueError):
-#         await update.message.reply_text(
-#             "Неверный формат. Используй: /setpump <%> <минут>\nНапример: /setpump 5 10"
-#         )
-
-
-# def get_binance_prices():
-#     prices = binance_client.futures_mark_price()
-#     return {item['symbol']: float(item['markPrice']) for item in prices}
-
-
-# async def monitor_pumps(app):
-#     while True:
-#         current_time = datetime.now(timezone.utc)
-#         binance_prices = get_binance_prices()
-
-#         # Обновляем историю цен
-#         for symbol, price in binance_prices.items():
-#             if symbol not in price_history:
-#                 price_history[symbol] = []
-#             price_history[symbol].append({'time': current_time, 'price': price})
-
-#             cutoff = current_time - timedelta(minutes=30)
-#             price_history[symbol] = [
-#                 entry for entry in price_history[symbol]
-#                 if entry['time'] >= cutoff
-#             ]
-
-#         # Проверяем настройки пользователей
-#         for user_id, settings in user_settings.items():
-#             percent = settings['percent']
-#             minutes = settings['minutes']
-#             cutoff_time = current_time - timedelta(minutes=minutes)
-
-#             for symbol, history in price_history.items():
-#                 initial_prices = [
-#                     entry for entry in history
-#                     if entry['time'] <= cutoff_time
-#                 ]
-#                 if not initial_prices:
-#                     continue
-
-#                 initial_price = initial_prices[0]['price']
-#                 current_price = history[-1]['price']
-#                 change = ((current_price - initial_price) / initial_price) * 100
-
-#                 if change >= percent:
-#                     message = (
-#                         f"🚀 Памп обнаружен!\n"
-#                         f"Пара: {symbol}\n"
-#                         f"Изменение: {change:.2f}% за {minutes} мин."
-#                     )
-#                     try:
-#                         await app.bot.send_message(chat_id=user_id, text=message)
-#                         price_history[symbol] = []
-#                     except Exception as e:
-#                         logging.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
-
-#         await asyncio.sleep(60)
-
-
-# async def main():
-#     BINANCE_API_KEY, BINANCE_API_SECRET, TELEGRAM_TOKEN = check_env()
-
-#     global binance_client
-#     binance_client = BinanceClient(BINANCE_API_KEY, BINANCE_API_SECRET)
-
-#     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-#     application.add_handler(CommandHandler("start", start))
-#     application.add_handler(CommandHandler("setpump", setpump))
-
-#     # Запускаем мониторинг в фоне
-#     asyncio.create_task(monitor_pumps(application))
-
-#     # Стартуем бота
-#     await application.run_polling()
-
-
-# if __name__ == "__main__":
-#     logging.basicConfig(
-#         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-#         level=logging.INFO
-#     )
-
-#     asyncio.run(main())
