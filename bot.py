@@ -7,9 +7,8 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     CallbackContext,
-    JobQueue,
-    Job
 )
+from datetime import datetime, timedelta
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -18,82 +17,90 @@ logging.basicConfig(
 
 # Храним настройки пользователей:
 # user_alerts[chat_id] = {
-#     "pump_percent": <int>,
+#     "pump_percent": <float>,
 #     "time_window": <int>
 # }
 user_alerts = {}
 
-# ====== Получаем цену (или свечи) с Binance Futures ======
+# ====== Получаем исторические данные с Binance Futures ======
 
-def fetch_futures_prices():
+def fetch_historical_price(symbol: str, interval: str, lookback: int):
     """
-    Получаем данные по всем парам фьючерсов.
-    Для примера используем 24h тикеры:
-    https://binance-docs.github.io/apidocs/futures/en/#24hr-ticker-price-change-statistics
-    Вернёт список словарей, где у каждого тикера есть поля:
-      - symbol
-      - lastPrice
-      - openPrice
-      - priceChangePercent (и т.д.)
+    Получает исторические данные свечей для заданного символа.
+    :param symbol: Торговая пара, например, 'BTCUSDT'
+    :param interval: Интервал свечи, например, '1m' для 1 минуты
+    :param lookback: Количество свечей для получения
+    :return: Список свечей или пустой список в случае ошибки
     """
-    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    url = "https://fapi.binance.com/fapi/v1/klines"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": lookback
+    }
     try:
-        resp = requests.get(url, timeout=5)
+        resp = requests.get(url, params=params, timeout=5)
         data = resp.json()
-        return data  # список словарей
+        return data  # Список свечей
     except Exception as e:
-        logging.error(f"Ошибка при запросе к Binance: {e}")
+        logging.error(f"Ошибка при запросе к Binance для {symbol}: {e}")
         return []
+
+def get_price_change_percent(symbol: str, time_window: int):
+    """
+    Рассчитывает процент изменения цены за заданный временной промежуток.
+    :param symbol: Торговая пара, например, 'BTCUSDT'
+    :param time_window: Временной промежуток в минутах
+    :return: Процент изменения цены или None в случае ошибки
+    """
+    # Binance поддерживает интервалы до 1 минут
+    interval = '1m'
+    lookback = time_window + 1  # +1 для получения начальной и конечной цены
+
+    klines = fetch_historical_price(symbol, interval, lookback)
+    if len(klines) < lookback:
+        logging.warning(f"Недостаточно данных для {symbol}")
+        return None
+
+    try:
+        start_price = float(klines[0][1])  # Цена открытия первой свечи
+        end_price = float(klines[-1][4])   # Цена закрытия последней свечи
+        change_percent = ((end_price - start_price) / start_price) * 100
+        return change_percent
+    except Exception as e:
+        logging.error(f"Ошибка при расчёте изменения цены для {symbol}: {e}")
+        return None
 
 def check_pump_for_user(chat_id, context: CallbackContext):
     """
-    Проверяем, какие монеты выросли на нужный процент за нужный промежуток
-    (упрощённо используем priceChangePercent за 24 часа).
-    В реальном случае нужно было бы подгрузить исторические данные за N минут.
+    Проверяет, какие монеты выросли на нужный процент за заданный временной промежуток.
     """
-    # Берём настройки пользователя
     settings = user_alerts.get(chat_id)
     if not settings:
         return  # У пользователя не задано ничего
 
     pump_percent = settings["pump_percent"]
-    time_window = settings["time_window"]  # пока не используем в упрощённом примере
+    time_window = settings["time_window"]  # В минутах
 
     # Получаем данные о фьючерсных парах
-    ticker_data = fetch_futures_prices()
-    if not ticker_data:
-        return
+    # Для примера используем список популярных пар
+    symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'XRPUSDT']  # Можно расширить список
 
-    # Фильтруем пары, у которых процент роста за 24h >= pump_percent
     pumped_coins = []
-    for item in ticker_data:
-        try:
-            symbol = item["symbol"]
-            price_change_pct = float(item["priceChangePercent"])  # 24h процент
-            if price_change_pct >= pump_percent:
-                pumped_coins.append(symbol)
-        except:
-            # Если вдруг не хватило полей, пропустим
+    for symbol in symbols:
+        change = get_price_change_percent(symbol, time_window)
+        if change is None:
             continue
+        if change >= pump_percent:
+            pumped_coins.append(f"{symbol} ({change:.2f}%)")
 
     # Если что-то нашли, отправим пользователю
     if pumped_coins:
         message = (
-            f"За последние 24 часа эти пары выросли более чем на {pump_percent}%:\n"
+            f"За последние {time_window} минут следующие пары выросли более чем на {pump_percent}%:\n"
             + ", ".join(pumped_coins)
         )
         context.bot.send_message(chat_id=chat_id, text=message)
-
-def pump_scanner(context: CallbackContext):
-    """
-    Функция, которую будет вызывать job_queue каждую минуту.
-    Проходимся по всем пользователям, у кого есть настройки, и проверяем памп.
-    """
-    # Смотрим все chat_id, для которых есть настройки
-    for chat_id in user_alerts.keys():
-        check_pump_for_user(chat_id, context)
-
-# ====== Обработчики команд ======
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -141,6 +148,15 @@ async def set_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Настройки сохранены.\n"
         f"Буду проверять каждые 1 минуту, есть ли монеты с ростом >= {pump_percent}% за {time_window} мин."
     )
+
+def pump_scanner(context: CallbackContext):
+    """
+    Функция, которую будет вызывать job_queue каждую минуту.
+    Проходимся по всем пользователям, у кого есть настройки, и проверяем памп.
+    """
+    # Смотрим все chat_id, для которых есть настройки
+    for chat_id in user_alerts.keys():
+        check_pump_for_user(chat_id, context)
 
 def main():
     # Получаем токен из переменной окружения
